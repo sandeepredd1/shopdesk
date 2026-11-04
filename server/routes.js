@@ -1,3 +1,4 @@
+
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { randomBytes } = require("node:crypto");
@@ -5,6 +6,7 @@ const { User, Product, Order } = require("./models");
 const { requireAuth } = require("./middleware");
 
 const router = express.Router();
+
 const categories = ["Electronics", "Clothing", "Home", "Accessories"];
 const statuses = ["Pending", "Shipped", "Delivered", "Cancelled"];
 
@@ -23,11 +25,12 @@ function makeToken(user) {
   );
 }
 
+// Production cookie configuration for Netlify + Render.
 function setAuthCookie(res, token) {
   res.cookie("shopdesk_token", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     maxAge: 24 * 60 * 60 * 1000,
     path: "/"
   });
@@ -40,13 +43,18 @@ function validateProduct(body) {
   const stock = Number(body.stock);
   const imageUrl = String(body.imageUrl || "").trim();
 
-  if (!name) throw Object.assign(new Error("Product name is required"), { status: 400 });
+  if (!name) {
+    throw Object.assign(new Error("Product name is required"), { status: 400 });
+  }
+
   if (!categories.includes(category)) {
     throw Object.assign(new Error("Select a valid category"), { status: 400 });
   }
+
   if (!Number.isFinite(price) || price <= 0) {
     throw Object.assign(new Error("Price must be greater than zero"), { status: 400 });
   }
+
   if (!Number.isInteger(stock) || stock < 0) {
     throw Object.assign(new Error("Stock must be a non-negative whole number"), { status: 400 });
   }
@@ -54,42 +62,59 @@ function validateProduct(body) {
   return { name, category, price, stock, imageUrl };
 }
 
-// Public login endpoint.
+// Login
 router.post("/auth/login", async (req, res, next) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !password) {
-      return res.status(400).json({ message: "Enter a valid email and password" });
+      return res.status(400).json({
+        message: "Enter a valid email and password"
+      });
     }
 
     const user = await User.findOne({ email });
+
     if (!user || !(await user.comparePassword(password))) {
-      return res.status(401).json({ message: "Incorrect email or password" });
+      return res.status(401).json({
+        message: "Incorrect email or password"
+      });
     }
 
     const token = makeToken(user);
     setAuthCookie(res, token);
 
-    res.json({ user: publicUser(user), token });
+    res.json({
+      user: publicUser(user),
+      token
+    });
   } catch (err) {
     next(err);
   }
 });
 
+// Signup
 router.post("/auth/signup", async (req, res, next) => {
   try {
     const name = String(req.body.name || "").trim();
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
 
-    if (!name) return res.status(400).json({ message: "Name is required" });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ message: "Enter a valid email address" });
+    if (!name) {
+      return res.status(400).json({ message: "Name is required" });
     }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        message: "Enter a valid email address"
+      });
+    }
+
     if (password.length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
+      return res.status(400).json({
+        message: "Password must be at least 8 characters"
+      });
     }
 
     const user = await User.create({
@@ -107,69 +132,120 @@ router.post("/auth/signup", async (req, res, next) => {
   }
 });
 
-// Everything below requires authentication.
+// All routes below require authentication.
 router.use(requireAuth);
 
+// Current user
 router.get("/auth/me", async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id);
-    if (!user) return res.status(401).json({ message: "User not found" });
+
+    if (!user) {
+      return res.status(401).json({ message: "User not found" });
+    }
+
     res.json({ user: publicUser(user) });
   } catch (err) {
     next(err);
   }
 });
 
+// Logout
 router.post("/auth/logout", (req, res) => {
   res.clearCookie("shopdesk_token", {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     path: "/"
   });
+
   res.json({ message: "Logged out successfully" });
 });
 
-// Dashboard stats and the last 14 days of orders.
+// Dashboard stats
 router.get("/stats", async (req, res, next) => {
   try {
     const userId = req.user._id;
+
     const fourteenDaysAgo = new Date();
     fourteenDaysAgo.setHours(0, 0, 0, 0);
     fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 13);
 
-    const [products, orderCount, revenueResult, lowStock, recentOrders, dailyOrders] =
-      await Promise.all([
-        Product.countDocuments({ userId }),
-        Order.countDocuments({ userId }),
-        Order.aggregate([
-          { $match: { userId, status: { $ne: "Cancelled" } } },
-          { $group: { _id: null, total: { $sum: "$total" } } }
-        ]),
-        Product.countDocuments({ userId, stock: { $lt: 10 } }),
-        Order.find({ userId }).sort({ createdAt: -1 }).limit(5).lean(),
-        Order.aggregate([
-          { $match: { userId, createdAt: { $gte: fourteenDaysAgo } } },
-          {
-            $group: {
-              _id: {
-                $dateToString: { format: "%Y-%m-%d", date: "$createdAt" }
-              },
-              orders: { $sum: 1 }
-            }
-          },
-          { $sort: { _id: 1 } }
-        ])
-      ]);
+    const [
+      products,
+      orderCount,
+      revenueResult,
+      lowStock,
+      recentOrders,
+      dailyOrders
+    ] = await Promise.all([
+      Product.countDocuments({ userId }),
 
-    const byDay = new Map(dailyOrders.map((item) => [item._id, item.orders]));
+      Order.countDocuments({ userId }),
+
+      Order.aggregate([
+        {
+          $match: {
+            userId,
+            status: { $ne: "Cancelled" }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$total" }
+          }
+        }
+      ]),
+
+      Product.countDocuments({
+        userId,
+        stock: { $lt: 10 }
+      }),
+
+      Order.find({ userId })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+
+      Order.aggregate([
+        {
+          $match: {
+            userId,
+            createdAt: { $gte: fourteenDaysAgo }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt"
+              }
+            },
+            orders: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ])
+    ]);
+
+    const byDay = new Map(
+      dailyOrders.map((item) => [item._id, item.orders])
+    );
+
     const chart = [];
 
     for (let i = 0; i < 14; i++) {
       const day = new Date(fourteenDaysAgo);
       day.setDate(day.getDate() + i);
+
       const key = day.toISOString().slice(0, 10);
-      chart.push({ date: key, orders: byDay.get(key) || 0 });
+
+      chart.push({
+        date: key,
+        orders: byDay.get(key) || 0
+      });
     }
 
     res.json({
@@ -187,7 +263,7 @@ router.get("/stats", async (req, res, next) => {
   }
 });
 
-// Products list, search, filter and pagination.
+// Products list, search, filter and pagination
 router.get("/products", async (req, res, next) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -196,11 +272,24 @@ router.get("/products", async (req, res, next) => {
     const category = String(req.query.category || "");
 
     const filter = { userId: req.user._id };
-    if (search) filter.name = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
-    if (categories.includes(category)) filter.category = category;
+
+    if (search) {
+      filter.name = {
+        $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        $options: "i"
+      };
+    }
+
+    if (categories.includes(category)) {
+      filter.category = category;
+    }
 
     const [products, total] = await Promise.all([
-      Product.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
+      Product.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+
       Product.countDocuments(filter)
     ]);
 
@@ -218,59 +307,89 @@ router.get("/products", async (req, res, next) => {
   }
 });
 
+// Add product
 router.post("/products", async (req, res, next) => {
   try {
     const product = await Product.create({
       ...validateProduct(req.body),
       userId: req.user._id
     });
-    res.status(201).json({ product, message: "Product created successfully" });
+
+    res.status(201).json({
+      product,
+      message: "Product created successfully"
+    });
   } catch (err) {
     next(err);
   }
 });
 
+// Update product
 router.put("/products/:id", async (req, res, next) => {
   try {
     const product = await Product.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      {
+        _id: req.params.id,
+        userId: req.user._id
+      },
       validateProduct(req.body),
-      { new: true, runValidators: true }
+      {
+        new: true,
+        runValidators: true
+      }
     );
 
-    if (!product) return res.status(404).json({ message: "Product not found" });
-    res.json({ product, message: "Product updated successfully" });
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    res.json({
+      product,
+      message: "Product updated successfully"
+    });
   } catch (err) {
     next(err);
   }
 });
 
+// Delete product
 router.delete("/products/:id", async (req, res, next) => {
   try {
     const product = await Product.findOneAndDelete({
       _id: req.params.id,
       userId: req.user._id
     });
-    if (!product) return res.status(404).json({ message: "Product not found" });
+
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
     res.json({ message: "Product deleted successfully" });
   } catch (err) {
     next(err);
   }
 });
 
-// Orders.
+// Orders list
 router.get("/orders", async (req, res, next) => {
   try {
     const status = String(req.query.status || "");
     const filter = { userId: req.user._id };
-    if (statuses.includes(status)) filter.status = status;
-    const orders = await Order.find(filter).sort({ createdAt: -1 });
+
+    if (statuses.includes(status)) {
+      filter.status = status;
+    }
+
+    const orders = await Order.find(filter)
+      .sort({ createdAt: -1 });
+
     res.json({ orders });
   } catch (err) {
     next(err);
   }
 });
 
+// Create order
 router.post("/orders", async (req, res, next) => {
   try {
     const customerName = String(req.body.customerName || "").trim();
@@ -278,16 +397,27 @@ router.post("/orders", async (req, res, next) => {
     const total = Number(req.body.total);
 
     if (!customerName) {
-      return res.status(400).json({ message: "Customer name is required" });
+      return res.status(400).json({
+        message: "Customer name is required"
+      });
     }
+
     if (customerName.length > 100) {
-      return res.status(400).json({ message: "Customer name must be 100 characters or fewer" });
+      return res.status(400).json({
+        message: "Customer name must be 100 characters or fewer"
+      });
     }
+
     if (!Number.isInteger(items) || items < 1) {
-      return res.status(400).json({ message: "Items must be a positive whole number" });
+      return res.status(400).json({
+        message: "Items must be a positive whole number"
+      });
     }
+
     if (!Number.isFinite(total) || total <= 0) {
-      return res.status(400).json({ message: "Order total must be greater than zero" });
+      return res.status(400).json({
+        message: "Order total must be greater than zero"
+      });
     }
 
     const order = await Order.create({
@@ -299,41 +429,67 @@ router.post("/orders", async (req, res, next) => {
       status: "Pending"
     });
 
-    res.status(201).json({ order, message: "Order created successfully" });
+    res.status(201).json({
+      order,
+      message: "Order created successfully"
+    });
   } catch (err) {
     next(err);
   }
 });
 
+// Update order status
 router.patch("/orders/:id/status", async (req, res, next) => {
   try {
     const status = String(req.body.status || "");
+
     if (!statuses.includes(status)) {
-      return res.status(400).json({ message: "Select a valid order status" });
+      return res.status(400).json({
+        message: "Select a valid order status"
+      });
     }
 
     const order = await Order.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      {
+        _id: req.params.id,
+        userId: req.user._id
+      },
       { status },
-      { new: true, runValidators: true }
+      {
+        new: true,
+        runValidators: true
+      }
     );
 
-    if (!order) return res.status(404).json({ message: "Order not found" });
-    res.json({ order, message: "Order status updated successfully" });
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    res.json({
+      order,
+      message: "Order status updated successfully"
+    });
   } catch (err) {
     next(err);
   }
 });
 
-// Profile and optional password change.
+// Profile and optional password change
 router.put("/users/me", async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id);
-    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
 
     if (req.body.name !== undefined) {
       const name = String(req.body.name).trim();
-      if (!name) return res.status(400).json({ message: "Name is required" });
+
+      if (!name) {
+        return res.status(400).json({ message: "Name is required" });
+      }
+
       user.name = name;
     }
 
@@ -342,18 +498,31 @@ router.put("/users/me", async (req, res, next) => {
     }
 
     if (req.body.newPassword) {
-      if (!(await user.comparePassword(String(req.body.currentPassword || "")))) {
-        return res.status(400).json({ message: "Current password is incorrect" });
+      if (
+        !(await user.comparePassword(
+          String(req.body.currentPassword || "")
+        ))
+      ) {
+        return res.status(400).json({
+          message: "Current password is incorrect"
+        });
       }
+
       if (String(req.body.newPassword).length < 8) {
-        return res.status(400).json({ message: "New password must be at least 8 characters" });
+        return res.status(400).json({
+          message: "New password must be at least 8 characters"
+        });
       }
-      // The schema hashes passwordHash whenever it changes.
+
       user.passwordHash = String(req.body.newPassword);
     }
 
     await user.save();
-    res.json({ user: publicUser(user), message: "Profile updated successfully" });
+
+    res.json({
+      user: publicUser(user),
+      message: "Profile updated successfully"
+    });
   } catch (err) {
     next(err);
   }
